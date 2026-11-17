@@ -8,9 +8,11 @@ from app.config import Config
 def connect(db_path: str | None = None) -> sqlite3.Connection:
     path = db_path or Config.database()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 互斥写兜底：锁竞争时等待而不是立刻抛 database is locked
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
@@ -98,8 +100,33 @@ CREATE TABLE IF NOT EXISTS reconcile_reports (
   destroyed_count INTEGER NOT NULL,
   pending_judgment_count INTEGER NOT NULL,
   mismatch_count INTEGER NOT NULL,
+  release_pending_count INTEGER NOT NULL DEFAULT 0,
+  release_approved_count INTEGER NOT NULL DEFAULT 0,
+  release_rejected_count INTEGER NOT NULL DEFAULT 0,
+  release_stale_count INTEGER NOT NULL DEFAULT 0,
   summary TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 下游入库放行单：闸口判定与快照留痕同表（留痕方式择一，见 README「入库放行」节）。
+-- 不另建拒绝事件表：拒绝原因 / 分区态快照 / 操作人直接留存在本单快照字段上。
+CREATE TABLE IF NOT EXISTS release_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_no TEXT NOT NULL UNIQUE,
+  partition_id INTEGER NOT NULL,
+  domain_code TEXT NOT NULL,
+  biz_date TEXT NOT NULL,
+  -- 申请时刻对分区实物的快照（放行单快照字段，留痕用，不随后续分区变化而变）
+  snapshot_state TEXT NOT NULL,
+  snapshot_row_count INTEGER NOT NULL,
+  -- 闸口判定
+  status TEXT NOT NULL CHECK (status IN ('待放行','已放行','已拒绝')),
+  reject_reason TEXT NOT NULL DEFAULT '',
+  decided_state TEXT NOT NULL DEFAULT '',
+  operator TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  decided_at TEXT,
+  FOREIGN KEY(partition_id) REFERENCES partitions(id)
 );
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -129,6 +156,8 @@ SEED_PARTITIONS = [
     ("events", "2026-11-15", 5100, "在线"),
     ("inventory", "2026-10-30", 300, "在线"),
     ("inventory", "2026-11-11", 310, "在线"),
+    # 已销毁空分区：用于演示闸口对「空分区当入库源」的拦截
+    ("events", "2026-11-02", 0, "已销毁"),
 ]
 
 
@@ -151,6 +180,41 @@ def init_db(db_path: str | None = None) -> None:
                     "VALUES (?,?,?,?)",
                     (domain_code, biz_date, row_count, state),
                 )
+
+            def _part_id(code: str, day: str) -> int:
+                row = conn.execute(
+                    "SELECT id FROM partitions WHERE domain_code = ? AND biz_date = ?",
+                    (code, day),
+                ).fetchone()
+                return int(row["id"])
+
+            # 预置放行单：一张待放行（在线有量，可过闸）；一张对已销毁空分区的单，
+            # 按闸口规则直接留痕为「已拒绝」并写明拒绝原因与分区态。
+            good = _part_id("orders", "2026-11-01")
+            empty = _part_id("events", "2026-11-02")
+            conn.execute(
+                "INSERT INTO release_orders "
+                "(order_no, partition_id, domain_code, biz_date, snapshot_state, "
+                "snapshot_row_count, status, reject_reason, decided_state, operator) "
+                "VALUES (?,?,?,?,?,?, '待放行', '', '', '')",
+                ("RL-SEED-001", good, "orders", "2026-11-01", "在线", 1200),
+            )
+            conn.execute(
+                "INSERT INTO release_orders "
+                "(order_no, partition_id, domain_code, biz_date, snapshot_state, "
+                "snapshot_row_count, status, reject_reason, decided_state, operator, "
+                "decided_at) "
+                "VALUES (?,?,?,?,?,?, '已拒绝', ?, '已销毁', 'system-seed', datetime('now'))",
+                (
+                    "RL-SEED-002",
+                    empty,
+                    "events",
+                    "2026-11-02",
+                    "已销毁",
+                    0,
+                    "分区已销毁（空分区），不可作为下游入库源",
+                ),
+            )
             conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('lab_name', ?)",
                 (Config.LAB_NAME,),

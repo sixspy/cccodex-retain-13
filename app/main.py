@@ -8,13 +8,19 @@ from itsdangerous import BadSignature, URLSafeSerializer
 from app.config import Config
 from app.db import get_db, init_db
 from app.services import (
+    ReleaseConflict,
+    create_release_order,
+    decide_release_order,
     execute_judgment,
+    get_report_detail,
     list_judgments,
     list_partitions,
     list_policies,
     list_reports,
+    list_release_orders,
     list_runs,
     list_scan_jobs,
+    release_summary,
     run_expire_scan,
     run_reconcile,
 )
@@ -178,3 +184,56 @@ async def api_reconcile(request: Request):
     with get_db() as conn:
         report = run_reconcile(conn, as_of)
     return {"ok": True, "report": report}
+
+
+@app.get("/api/reconcile-reports/{report_id}")
+def api_report_detail(request: Request, report_id: int):
+    require_user(request)
+    with get_db() as conn:
+        report = get_report_detail(conn, report_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="对账报告不存在")
+    return {"ok": True, "report": report}
+
+
+@app.get("/api/release-orders")
+def api_release_orders(request: Request, status: str | None = None):
+    require_user(request)
+    with get_db() as conn:
+        return {
+            "items": list_release_orders(conn, status=status),
+            "summary": release_summary(conn),
+        }
+
+
+@app.post("/api/release-orders")
+async def api_create_release(request: Request):
+    operator = require_user(request)
+    body = await request.json()
+    partition_id = body.get("partition_id")
+    if not isinstance(partition_id, int):
+        raise HTTPException(status_code=400, detail="缺少 partition_id")
+    try:
+        with get_db() as conn:
+            order = create_release_order(conn, partition_id)
+    except ReleaseConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "order": order, "operator": operator}
+
+
+@app.post("/api/release-orders/{order_id}/decide")
+def api_decide_release(request: Request, order_id: int):
+    operator = require_user(request)
+    try:
+        with get_db() as conn:
+            order = decide_release_order(conn, order_id, operator)
+    except ReleaseConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "order": order}
+
+
+@app.get("/api/release-summary")
+def api_release_summary(request: Request):
+    require_user(request)
+    with get_db() as conn:
+        return release_summary(conn)
